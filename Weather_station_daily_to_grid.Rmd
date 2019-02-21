@@ -1,0 +1,292 @@
+---
+title: "Interpolate weather station data"
+output: 
+  html_document:
+    self_contained: true
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+---
+
+<!-- saved from url=(0014)about:internet -->
+<!-- This needs to be manually added to the second line of the html for IE and Edge compatibility -->
+
+```{r setup, include=FALSE}
+# This chunk installs any necessary packages, loads them into R, and creates a temporary output directory inside the user's home directory for output of this process.
+knitr::opts_chunk$set(echo=T, warning=F, message=F)
+options(width = 2000)
+
+# Install any needed packages. 
+packs = c("doParallel",
+          "foreach",
+          "tidyverse",
+          "maps",
+          "DT",
+          "gstat",
+          "raster")
+installed = installed.packages()
+
+for(i in packs){
+  if(!i %in% rownames(installed)){ install.packages(i, dependencies = T) }
+  }
+
+library(doParallel)
+library(foreach) # both of these for parallel computation
+library(tidyverse)
+library(maps) # for mapping base layers
+library(DT) # for datatable
+library(gstat) # For kriging
+library(raster) # masks several functions from dplyr
+
+usedir <- normalizePath("~/Interpolate_Weather_Temp")
+if(length(dir(usedir))==0){ system(paste('mkdir -p', usedir)) }
+knitr::opts_knit$set(root.dir = usedir) 
+```
+
+## Overview
+
+This document provides a working example for how to carry out spatial interpolation in R. This process shows how to take daily weather station data and produce gridded, daily data from a smooth raster layer for each day, each weather variable of interest.
+
+This document relies substantially on this resource:
+
+- http://rspatial.org/analysis/rst/4-interpolation.html
+
+### Requirements to run yourself 
+
+This is an interactive document written in [RMarkdown](https://rmarkdown.rstudio.com/) and contains all the necessary code to run on a machine with R installed. Use of RStudio is recommended; this IDE is available [here](https://www.rstudio.com/) or as part of [Anaconda](https://www.anaconda.com/distribution/).
+
+This code and example data are available here on [GitHub](https://github.com/dflynn-volpe/Interpolate_Weather_Volpe), feel free to modify and reproduce with attribution.
+
+## Getting data in
+
+R can read in data from any number of sources, including Oracle or SQLite database, APIs, or flat files. Here I'm providing weather station data for the state of Tennessee, from the Global Historical Climate Network data, made available through [NOAA](https://www.ncdc.noaa.gov/cdo-web/search?datasetid=GHCND). 
+
+These data have already been prepared to some extent, to select only a few variables, and to join with lat/long and elevation from a general station information data table.
+
+```{r inputdata}
+# Define the projection we want to use 
+proj.USGS <- "+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-96 +x_0=0 +y_0=0 +datum=NAD83 +units=m +no_defs +ellps=GRS80 +towgs84=0,0,0"
+
+# Grab files from GitHub
+# Read in weather station data from GHCN
+# wx <- read.csv("put in github locaiton here")
+
+wx <- read.csv("TN_Station_Data_2017-04-01_to_2018-03-31.csv")
+
+# Download grid shapefile .zip from GitHub and unzip into the working directory
+unzip("TN_01dd_fishnet.zip")
+
+# Make weather station data into a spatial points data frame
+wx.proj <- SpatialPointsDataFrame(wx[c("lon", "lat")], 
+                                       wx,
+                                       proj4string = CRS("+proj=longlat +datum=WGS84"))
+  
+wx.proj <- spTransform(wx.proj, CRS(proj.USGS))
+  
+# Read in grid
+grid_shp <- rgdal::readOGR(usedir, layer = "TN_01dd_fishnet")
+grid_shp <- spTransform(grid_shp, CRS(proj.USGS))
+
+# Format date and add a month field  
+wx <- wx %>%
+  mutate(DATE = as.Date(as.character(DATE))) %>%
+  mutate(mo = format(DATE, "%m"))
+```
+
+Now that we have the data in, we can make some basic plots first for some sanity checks.
+
+Here we plot the average daily maximum temperature for each station, for the month of June, as well as the total annual precipitation recorded for each station. We also show the grid layer we eventually want to interpolate to.
+
+```{r point_plots}
+wx.avg.jun.T <- wx %>%
+  group_by(STATION, lon, lat) %>%
+  filter(mo == "06") %>%
+  summarize(avgtempmax = mean(TMAX, na.rm=T),
+            avgtempmin = mean(TMIN, na.rm=T)
+  )
+wx.jun.proj <- spTransform(SpatialPointsDataFrame(wx.avg.jun.T[c("lon", "lat")], 
+                                                  wx.avg.jun.T,
+                                                  proj4string = CRS("+proj=longlat +datum=WGS84")), CRS(proj.USGS))
+
+wx.avg.ann.P <- wx %>%
+  group_by(STATION, lon, lat) %>%
+  summarize(sumprecip = sum(PRCP, na.rm=T))
+wx.prcp.proj <- spTransform(SpatialPointsDataFrame(wx.avg.ann.P[c("lon", "lat")], 
+                                                   wx.avg.ann.P,
+                                                   proj4string = CRS("+proj=longlat +datum=WGS84")), CRS(proj.USGS))
+
+plot(grid_shp, col = 'lightgrey')
+tempcol <- colorRampPalette(c("purple", "blue", "green", "yellow", "orange", "red"))
+cuts = cut(wx.jun.proj$avgtempmax, 12)
+points(wx.jun.proj$lon, wx.jun.proj$lat,
+       col = scales::alpha(tempcol(12)[cuts], 0.7), pch = 16, cex = 3)
+legend("bottomright", pch = 16, col = tempcol(12),
+       legend = levels(cuts),
+       cex = 0.8, ncol = 4, pt.cex = 2)
+title(main = "June 2018 average high temperatures")
+
+plot(grid_shp, col = 'lightgrey')
+preccol <- colorRampPalette(c("white", "bisque", "green", "cornflowerblue", "blue", "purple"), alpha = T)
+cuts = cut(wx.prcp.proj$sumprecip, 12)
+points(wx.prcp.proj$lon, wx.prcp.proj$lat,
+       col = scales::alpha(preccol(12)[cuts], 0.7), pch = 16, cex = 3)
+legend("bottomright", pch = 16, col = preccol(12),
+       legend = levels(cuts),
+       cex = 0.8, ncol = 4, pt.cex = 2)
+title(main = "Total precipitation")
+
+```
+
+Options: nearest neighbor interpolation, inverse distance weighted, ordinary kriging...
+Will make one raster for each variable of interest, per day, and then apply to grid/hour.
+Here use kriging from gstat. Models are all based on spatial variance of the target variable
+
+Create an empty raster grid for the state; we will interpolate over this grid, then assign values from the raster to each grid cell. Increase n for smaller raster cells (more time-intensive)
+
+```{r interpolation}
+grd <- as.data.frame(spsample(grid_shp, 'regular', n = 7500))
+names(grd) <- c("X", "Y")
+coordinates(grd) <- c("X", "Y")
+gridded(grd) <- TRUE # for SpatialPixel
+fullgrid(grd) <- TRUE # for SpatialGrid
+proj4string(grd) <- proj4string(grid_shp)
+  
+StartTime <- Sys.time()
+  
+writeLines(c(""), paste0("Prep_Weather_log.txt"))    
+  
+# Start loop ----
+# Can limit to a few select months with this code, or manually set 'do.months' to a value like '2017-06'.
+do.months = c(paste('2017', formatC(4:12, width = 2, flag = 0), sep = '-'),
+              paste('2018', formatC(1:3, width = 2, flag = 0), sep = '-'))
+
+# Start with one example month, comment out to run over whole data set 
+do.months = c('2017-06')
+
+all_wx_days = unique(wx$DATE)
+all_wx_ym = format(all_wx_days, "%Y-%m")
+use_wx_days = all_wx_days[all_wx_ym %in% do.months]
+  
+wx.grd.day <- foreach(day = use_wx_days, 
+                      .packages = c('raster','gstat','dplyr','rgdal'), 
+                      .combine = rbind) %dopar% {
+    # day = unique(wx$DATE)[1]
+                        
+  cat(paste(Sys.time()), as.character(day), "\n", 
+        file = paste0("Prep_Weather_log.txt"), append = T) 
+        
+  wx.day = wx.proj[wx.proj$DATE == day,]
+  
+  ### Precipitation                      
+  f.p <- as.formula(PRCP ~ 1)
+    
+  vg_prcp <- gstat::variogram(PRCP ~ 1, locations = wx.day[!is.na(wx.day$PRCP),])
+  dat.fit <- fit.variogram(vg_prcp, fit.ranges = F, fit.sills = F,
+                             vgm(model = "Sph"))
+  # plot(vg_prcp, dat.fit) # Plot the semi variogram. 
+  dat.krg.prcp <- krige(f.p, wx.day[!is.na(wx.day$PRCP),], grd, dat.fit)
+    
+  # Rasterize
+  prcp_r <- raster::raster(dat.krg.prcp)
+  prcp_r <- mask(prcp_r, grid_shp)
+  
+  ### Daily high temperatures
+  f.tmax <- as.formula(TMAX ~ 1)
+  vg_tmax <- variogram(TMAX ~ 1, wx.day[!is.na(wx.day$TMAX),])
+  dat.fit <- fit.variogram(vg_tmax, fit.ranges = F, fit.sills = F,
+                           vgm(model = "Sph"))
+  dat.krg.tmax <- krige(f.tmax, wx.day[!is.na(wx.day$TMAX),], grd, dat.fit)
+  tmax_r <- raster::raster(dat.krg.tmax)
+  tmax_r <- mask(tmax_r, grid_shp)
+    
+  # Apply to grid cells in year-day ----
+  # This is the most time-intensive step in the process.
+  # Need to extract values from the raster layers to the polygons
+  prcp_extr <- raster::extract(x = prcp_r,   # Raster object
+                               y = grid_shp, # SpatialPolygons
+                               fun = mean,
+                               df = TRUE)
+
+  names(prcp_extr)[2] = "PRCP"
+  prcp_extr$ID = grid_shp$GRID_ID
+    
+  daily_result <- data.frame(day, prcp_extr)
+    
+  tmax_extr <- raster::extract(x = tmax_r,   # Raster object
+                               y = grid_shp, # SpatialPolygons
+                               fun = mean,
+                               df = TRUE)
+  names(tmax_extr)[2] = "TMAX"
+  tmax_extr$ID = grid_shp$GRID_ID
+    
+  daily_result <- full_join(daily_result, tmax_extr)
+    
+  EndTime <- Sys.time()-StartTime
+  cat(as.character(day), 'completed', round(EndTime, 2), attr(EndTime, 'units'), '\n',
+      file = paste0("Prep_Weather_log.txt"), append = T) 
+    daily_result
+  } # end parallel loop
+```
+
+```{r}
+maxs <- wx.grd.day %>%
+  group_by(ID) %>%
+  summarize(maxP = max(PRCP, na.rm=T),
+            maxTmin = max(TMIN, na.rm=T),
+            maxTmax = max(TMAX, na.rm=T),
+            maxS = max(SNOW, na.rm=T))
+
+sumPS <- wx.grd.day %>%
+  group_by(ID) %>%
+  summarize(sumP = sum(PRCP, na.rm=T),
+            sumS = sum(SNOW, na.rm=T))
+
+wx.grd.day$mo = format(wx.grd.day$day, "%m")
+
+wx.avg.jun.T <- wx.grd.day %>%
+  group_by(ID) %>%
+  filter(mo == "06") %>%
+  summarize(avg.06.tempmax = mean(TMAX, na.rm=T),
+            avg.06.tempmin = mean(TMIN, na.rm=T))
+
+par(mfrow=c(1,2))
+hist(maxs$maxTmax, main = "Max TMAX by grid cell", col = "tomato")
+hist(maxs$maxP, main = "Max PRCP by grid cell", col = "cornflowerblue")
+hist(maxs$maxS, main = "Max SNOW by grid cell", col = "beige")
+
+# Join to grid cells, make similar summaries as before
+wx.by.id <- maxs
+wx.by.id <- left_join(wx.by.id, sumPS)
+wx.by.id <- left_join(wx.by.id, wx.avg.jun.T)
+  
+wx.by.id$ID <- as.character(wx.by.id$ID)
+  
+plotgrid <- grid_shp
+plotgrid@data <- left_join(plotgrid@data, wx.by.id, by = c("GRID_ID"="ID"))
+  
+plotgrid@data[plotgrid@data==-Inf] = NA
+  
+# Make maxTmax and sumP maps
+tempcol <- colorRampPalette(c("purple", "blue", "green", "yellow", "orange", "red"))
+
+cuts = cut(plotgrid@data$avg.06.tempmax, 10)
+plot(plotgrid, col = tempcol(10)[cuts], border =  tempcol(10)[cuts])
+legend("bottom", pch = 16, col = tempcol(10),
+       legend = levels(cuts),
+       cex = 0.8, ncol = 2, pt.cex = 2)
+title(main = "Average June high temperatures")
+  
+preccol <- colorRampPalette(c("white", "bisque", "green", "cornflowerblue", "blue", "purple"))
+
+cuts = cut(plotgrid@data$sumP, 10)
+plot(plotgrid, col = preccol(10)[cuts], border =  tempcol(10)[cuts])
+legend("bottom", pch = 16, col = preccol(10),
+       legend = levels(cuts),
+       cex = 0.8, ncol = 2, pt.cex = 2)
+title(main = "Sum of precipitation across the study period")
+
+# Save the final ouput
+save(list = c("wx.grd.day"), 
+       file = file.path(usedir, paste0(prepname, ".RData")))
+```
