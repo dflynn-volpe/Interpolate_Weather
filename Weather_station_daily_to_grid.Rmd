@@ -70,9 +70,15 @@ proj.USGS <- "+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-96 +x_0=0 +y_0
 
 # Grab files from GitHub
 # Read in weather station data from GHCN
-# wx <- read.csv("put in github locaiton here")
+wx <- read.csv("https://github.com/dflynn-volpe/Interpolate_Weather_Volpe/blob/master/TN_Station_Data_2017-04-01_to_2018-03-31.csv?raw=true")
 
-wx <- read.csv("TN_Station_Data_2017-04-01_to_2018-03-31.csv")
+zipget = httr::GET('https://github.com/dflynn-volpe/Interpolate_Weather_Volpe/blob/master/TN_01dd_fishnet.zip?raw=true')
+writeBin(httr::content(zipget, "raw"), 'TN_01dd_fishnet.zip')
+
+# Format date and add a month field  
+wx <- wx %>%
+  mutate(DATE = as.Date(as.character(DATE))) %>%
+  mutate(mo = format(DATE, "%m"))
 
 # Download grid shapefile .zip from GitHub and unzip into the working directory
 unzip("TN_01dd_fishnet.zip")
@@ -87,11 +93,6 @@ wx.proj <- spTransform(wx.proj, CRS(proj.USGS))
 # Read in grid
 grid_shp <- rgdal::readOGR(usedir, layer = "TN_01dd_fishnet")
 grid_shp <- spTransform(grid_shp, CRS(proj.USGS))
-
-# Format date and add a month field  
-wx <- wx %>%
-  mutate(DATE = as.Date(as.character(DATE))) %>%
-  mutate(mo = format(DATE, "%m"))
 ```
 
 Now that we have the data in, we can make some basic plots first for some sanity checks.
@@ -145,7 +146,7 @@ Here use kriging from gstat. Models are all based on spatial variance of the tar
 Create an empty raster grid for the state; we will interpolate over this grid, then assign values from the raster to each grid cell. Increase n for smaller raster cells (more time-intensive)
 
 ```{r interpolation}
-grd <- as.data.frame(spsample(grid_shp, 'regular', n = 7500))
+grd <- as.data.frame(spsample(grid_shp, 'regular', n = 10000))
 names(grd) <- c("X", "Y")
 coordinates(grd) <- c("X", "Y")
 gridded(grd) <- TRUE # for SpatialPixel
@@ -155,8 +156,11 @@ proj4string(grd) <- proj4string(grid_shp)
 StartTime <- Sys.time()
   
 writeLines(c(""), paste0("Prep_Weather_log.txt"))    
-  
-# Start loop ----
+
+# This step sets up the parallel process. In combination with foreach() below, it provides a simple way to take advantage of multiple cores.  
+cl <- makeCluster(parallel::detectCores())
+registerDoParallel(cl)
+
 # Can limit to a few select months with this code, or manually set 'do.months' to a value like '2017-06'.
 do.months = c(paste('2017', formatC(4:12, width = 2, flag = 0), sep = '-'),
               paste('2018', formatC(1:3, width = 2, flag = 0), sep = '-'))
@@ -167,14 +171,15 @@ do.months = c('2017-06')
 all_wx_days = unique(wx$DATE)
 all_wx_ym = format(all_wx_days, "%Y-%m")
 use_wx_days = all_wx_days[all_wx_ym %in% do.months]
+
+# Start loop ----
   
 wx.grd.day <- foreach(day = use_wx_days, 
                       .packages = c('raster','gstat','dplyr','rgdal'), 
                       .combine = rbind) %dopar% {
-    # day = unique(wx$DATE)[1]
-                        
-  cat(paste(Sys.time()), as.character(day), "\n", 
-        file = paste0("Prep_Weather_log.txt"), append = T) 
+    # day = use_wx_days[1]
+  
+  dayStartTime <- Sys.time()                      
         
   wx.day = wx.proj[wx.proj$DATE == day,]
   
@@ -222,42 +227,48 @@ wx.grd.day <- foreach(day = use_wx_days,
     
   daily_result <- full_join(daily_result, tmax_extr)
     
-  EndTime <- Sys.time()-StartTime
-  cat(as.character(day), 'completed', round(EndTime, 2), attr(EndTime, 'units'), '\n',
+  dayEndTime <- Sys.time() - dayStartTime
+  cat(as.character(day), 'completed', round(dayEndTime, 2), attr(dayEndTime, 'units'), '\n',
       file = paste0("Prep_Weather_log.txt"), append = T) 
     daily_result
   } # end parallel loop
+
+EndTime <- Sys.time()-StartTime
+cat('Entire process completed in', round(EndTime, 2), attr(EndTime, 'units'), '\n',
+      file = paste0("Prep_Weather_log.txt"), append = T) 
+
+# Save the ouput
+save(list = 'wx.grd.day', 
+       file = file.path(usedir, 'Interpolated_Gridded_Daily_Data.RData'))
+
 ```
 
-```{r}
+Finally, let's visualize the output
+
+```{r grid_plots}
 maxs <- wx.grd.day %>%
   group_by(ID) %>%
   summarize(maxP = max(PRCP, na.rm=T),
-            maxTmin = max(TMIN, na.rm=T),
-            maxTmax = max(TMAX, na.rm=T),
-            maxS = max(SNOW, na.rm=T))
+            maxTmax = max(TMAX, na.rm=T))
 
-sumPS <- wx.grd.day %>%
+sumP <- wx.grd.day %>%
   group_by(ID) %>%
-  summarize(sumP = sum(PRCP, na.rm=T),
-            sumS = sum(SNOW, na.rm=T))
+  summarize(sumP = sum(PRCP, na.rm=T))
 
 wx.grd.day$mo = format(wx.grd.day$day, "%m")
 
 wx.avg.jun.T <- wx.grd.day %>%
   group_by(ID) %>%
   filter(mo == "06") %>%
-  summarize(avg.06.tempmax = mean(TMAX, na.rm=T),
-            avg.06.tempmin = mean(TMIN, na.rm=T))
+  summarize(avg.06.tempmax = mean(TMAX, na.rm=T))
 
 par(mfrow=c(1,2))
 hist(maxs$maxTmax, main = "Max TMAX by grid cell", col = "tomato")
 hist(maxs$maxP, main = "Max PRCP by grid cell", col = "cornflowerblue")
-hist(maxs$maxS, main = "Max SNOW by grid cell", col = "beige")
 
 # Join to grid cells, make similar summaries as before
 wx.by.id <- maxs
-wx.by.id <- left_join(wx.by.id, sumPS)
+wx.by.id <- left_join(wx.by.id, sumP)
 wx.by.id <- left_join(wx.by.id, wx.avg.jun.T)
   
 wx.by.id$ID <- as.character(wx.by.id$ID)
@@ -269,6 +280,8 @@ plotgrid@data[plotgrid@data==-Inf] = NA
   
 # Make maxTmax and sumP maps
 tempcol <- colorRampPalette(c("purple", "blue", "green", "yellow", "orange", "red"))
+
+par(mfrow=c(1,1))
 
 cuts = cut(plotgrid@data$avg.06.tempmax, 10)
 plot(plotgrid, col = tempcol(10)[cuts], border =  tempcol(10)[cuts])
@@ -286,7 +299,4 @@ legend("bottom", pch = 16, col = preccol(10),
        cex = 0.8, ncol = 2, pt.cex = 2)
 title(main = "Sum of precipitation across the study period")
 
-# Save the final ouput
-save(list = c("wx.grd.day"), 
-       file = file.path(usedir, paste0(prepname, ".RData")))
 ```
