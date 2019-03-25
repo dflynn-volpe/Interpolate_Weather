@@ -42,6 +42,7 @@ library(raster) # masks several functions from dplyr
 usedir <- normalizePath("~/Interpolate_Weather_Temp")
 if(length(dir(usedir))==0){ system(paste('mkdir -p', usedir)) }
 knitr::opts_knit$set(root.dir = usedir) 
+# setwd(usedir) # run this if testing by running each chunk separately. Leave commented for knitting
 ```
 
 ## Overview
@@ -162,8 +163,8 @@ title(main = "Total June precipitation")
 
 There are a number of options for spatial interpolation from point to raster. These include nearest neighbor interpolation, inverse distance weighted (IDW), and ordinary kriging. 
 
-Will make one raster for each variable of interest, per day, and then apply to grid/hour.
-Here use kriging from the package [`gstat`](https://cran.r-project.org/web/packages/gstat/vignettes/gstat.pdf). Models are all based on spatial variance of the target variable. 
+We will make one raster for each variable of interest, per day, and then apply to grid/hour.
+Here we use kriging from the package [`gstat`](https://cran.r-project.org/web/packages/gstat/vignettes/gstat.pdf). Models are all based on spatial variance of the target variable. 
 
 The steps in brief are as follows:
 
